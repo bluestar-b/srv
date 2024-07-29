@@ -1,222 +1,273 @@
 package main
 
 import (
-	"flag"
-	"fmt"
-	"io"
-	"log"
-	"net"
-	"net/http"
-	"net/url"
-	"os"
-	"path"
-	"runtime"
-	"sort"
-	"strings"
-	"time"
+    "flag"
+    "fmt"
+    "io"
+    "log"
+    "net"
+    "net/http"
+    "net/url"
+    "os"
+    "path"
+    "sort"
+    "strings"
+    "time"
+    "goftp.io/server/v2"
+    "goftp.io/server/v2/driver/file"
 
-	"github.com/joshuarli/srv/internal/humanize"
 )
 
-type context struct {
-	srvDir string
+func FileSize(bytes int64) string {
+    if bytes < 1024 {
+        return fmt.Sprintf("%d B", bytes)
+    } else if bytes < 1024*1024 {
+        return fmt.Sprintf("%.2f KB", float64(bytes)/1024)
+    } else if bytes < 1024*1024*1024 {
+        return fmt.Sprintf("%.2f MB", float64(bytes)/(1024*1024))
+    } else {
+        return fmt.Sprintf("%.2f GB", float64(bytes)/(1024*1024*1024))
+    }
 }
 
-// We write the shortest browser-valid base64 data string,
-// so that the browser does not request the favicon.
-const listingPrelude = `<head><link rel=icon href=data:,><style>* { font-family: monospace; } table { border: none; margin: 1rem; } td { padding-right: 2rem; }</style></head>
-<table>`
+func FileCreationDate(t time.Time) string {
+    return t.Format("2006-01-02 15:04:05")
+}
+
+type context struct {
+    srvDir string
+}
+
+const listingPrelude = `<head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:,">
+<style>
+
+* {
+     font-family: monospace;
+}
+ table {
+     width: 100%;
+}
+ table {
+     border-spacing: 0;
+     border-collapse: collapse;
+}
+ td {
+     padding:0px;
+     overflow: hidden;
+     text-overflow: ellipsis;
+     white-space: nowrap;
+}
+ body {
+     background-color: black;
+     color: white;
+}
+ a:hover {
+     color: #eeb9da 
+}
+ a {
+     color: #ff3d98 
+}
+
+</style>
+</head>
+<table cellspacing="0">
+<thead>
+    <tr><th>Name</th><th>Size</th><th>Date</th></tr>
+</thead>
+<tbody>`
 
 func renderListing(w http.ResponseWriter, r *http.Request, f *os.File) error {
-	files, err := f.Readdir(-1)
-	if err != nil {
-		return err
-	}
+    files, err := f.Readdir(-1)
+    if err != nil {
+        return err
+    }
 
-	io.WriteString(w, listingPrelude)
+    io.WriteString(w, listingPrelude)
 
-	sort.Slice(files, func(i, j int) bool {
-		// TODO: add switch to make case sensitive
-		// TODO: add switch to disable natural sort
-		return humanize.NaturalLess(
-			strings.ToLower(files[i].Name()),
-			strings.ToLower(files[j].Name()),
-		)
-	})
+    sort.Slice(files, func(i, j int) bool {
+        return strings.ToLower(files[i].Name()) < strings.ToLower(files[j].Name())
+    })
 
-	var fn, fnEscaped string
-	for _, fi := range files {
-		fn = fi.Name()
-		fnEscaped = url.PathEscape(fn)
-		switch m := fi.Mode(); {
-		// is a directory - render a link
-		case m&os.ModeDir != 0:
-			fmt.Fprintf(w, "<tr><td><a href=\"%s/\">%s/</a></td></tr>", fnEscaped, fn)
-		// is a regular file - render both a link and a file size
-		case m&os.ModeType == 0:
-			fs := humanize.FileSize(fi.Size())
-			fmt.Fprintf(w, "<tr><td><a href=\"%s\">%s</a></td><td>%s</td></tr>", fnEscaped, fn, fs)
-		// otherwise, don't render a clickable link
-		default:
-			fmt.Fprintf(w, "<tr><td><p style=\"color: #777\">%s</p></td></tr>", fn)
-		}
-	}
+    var fn, fnEscaped string
+    for _, fi := range files {
+        fn = fi.Name()
+        fnEscaped = url.PathEscape(fn)
+        creationDate := FileCreationDate(fi.ModTime())
+        switch m := fi.Mode(); {
+        case m&os.ModeDir != 0:
+            fmt.Fprintf(w, "<tr><td><a href=\"%s/\">%s/</a></td><td></td><td></td></tr>", fnEscaped, fn)
+        case m&os.ModeType == 0:
+            fs := FileSize(fi.Size())
+            fmt.Fprintf(w, "<tr><td><a href=\"%s\">%s</a></td><td>%s</td><td>%s</td></tr>", fnEscaped, fn, fs, creationDate)
+        default:
+            fmt.Fprintf(w, "<tr><td><p>%s</p></td><td></td><td></td></tr>", fn)
 
-	io.WriteString(w, "</table>")
-	return nil
+        }
+    }
+
+    io.WriteString(w, "</tbody></table>")
+    return nil
 }
 
 func (c *context) handler(w http.ResponseWriter, r *http.Request) {
-	// TODO: better log styling
-	log.Printf("\t%s [%s]: %s %s %s", r.RemoteAddr, r.UserAgent(), r.Method, r.Proto, r.Host+r.RequestURI)
+    log.Printf("\t%s [%s]: %s %s %s", r.RemoteAddr, r.UserAgent(), r.Method, r.Proto, r.Host+r.RequestURI)
 
-	// Tell HTTP 1.1+ clients to not cache responses.
-	w.Header().Set("Cache-Control", "no-store")
+    w.Header().Set("Cache-Control", "no-store")
 
-	switch r.Method {
-	case http.MethodGet:
-		// Filenames could contain special uri characters, so we use r.RequestURI
-		// instead of r.URL.Path.
-		// XXX: Might also have to do QueryUnescape (and then also QueryEscape in the renderer),
-		// but haven't run into that as a need in my usage.
-		fp, err := url.PathUnescape(r.RequestURI)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to path unescape: %s", err), http.StatusInternalServerError)
-			return
-		}
-		fp = path.Join(c.srvDir, fp)
-		fi, err := os.Lstat(fp)
-		if err != nil {
-			// NOTE: errors.Is is generally preferred, since it can unwrap errors created like so:
-			//     fmt.Errorf("can't read file: %w", err)
-			// But in this case we just want to check right after a stat.
-			if os.IsNotExist(err) {
-				http.Error(w, "file not found", http.StatusNotFound)
-				return
-			}
-			http.Error(w, fmt.Sprintf("failed to stat file: %s", err), http.StatusInternalServerError)
-			return
-		}
+    switch r.Method {
+    case http.MethodGet:
+        fp, err := url.PathUnescape(r.RequestURI)
+        if err != nil {
+            http.Error(w, fmt.Sprintf("failed to path unescape: %s", err), http.StatusInternalServerError)
+            return
+        }
+        fp = path.Join(c.srvDir, fp)
+        fi, err := os.Lstat(fp)
+        if err != nil {
+            if os.IsNotExist(err) {
+                http.Error(w, "file not found", http.StatusNotFound)
+                return
+            }
+            http.Error(w, fmt.Sprintf("failed to stat file: %s", err), http.StatusInternalServerError)
+            return
+        }
 
-		f, err := os.Open(fp)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to open file: %s", err), http.StatusInternalServerError)
-			return
-		}
-		defer f.Close()
+        f, err := os.Open(fp)
+        if err != nil {
+            http.Error(w, fmt.Sprintf("failed to open file: %s", err), http.StatusInternalServerError)
+            return
+        }
+        defer f.Close()
 
-		switch m := fi.Mode(); {
-		// is a directory - serve an index.html if it exists, otherwise generate and serve a directory listing
-		case m&os.ModeDir != 0:
-			// XXX: if a symlink has name "index.html", it will be served here.
-			// i could add an extra lstat here, but the scenario is just too rare
-			// to justify the additional file operation.
-			html, err := os.Open(path.Join(fp, "index.html"))
-			if err == nil {
-				io.Copy(w, html)
-				html.Close()
-				return
-			}
-			html.Close()
-			err = renderListing(w, r, f)
-			if err != nil {
-				http.Error(w, "failed to render directory listing: "+err.Error(), http.StatusInternalServerError)
-			}
-		// is a regular file - serve its contents
-		case m&os.ModeType == 0:
-			// This deduces a mimetype from the file extension first, then falls back to DetectContentType.
-			// io.Copy'ing would only DetectContentType, which is insufficient for like, css files.
-			http.ServeContent(w, r, fp, time.Time{}, f)
-		// is a symlink - refuse to serve
-		case m&os.ModeSymlink != 0:
-			// TODO: add a flag to allow serving symlinks
-			http.Error(w, "file is a symlink", http.StatusForbidden)
-		default:
-			http.Error(w, "file isn't a regular file or directory", http.StatusForbidden)
-		}
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
+        switch m := fi.Mode(); {
+        case m&os.ModeDir != 0:
+            html, err := os.Open(path.Join(fp, "index.html"))
+            if err == nil {
+                io.Copy(w, html)
+                html.Close()
+                return
+            }
+            html.Close()
+            err = renderListing(w, r, f)
+            if err != nil {
+                http.Error(w, "failed to render directory listing: "+err.Error(), http.StatusInternalServerError)
+            }
+        case m&os.ModeType == 0:
+            http.ServeContent(w, r, fp, time.Time{}, f)
+        case m&os.ModeSymlink != 0:
+            http.Error(w, "file is a symlink", http.StatusForbidden)
+        default:
+            http.Error(w, "file isn't a regular file or directory", http.StatusForbidden)
+        }
+    default:
+        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+    }
 }
 
 func die(format string, v ...interface{}) {
-	fmt.Fprintf(os.Stderr, format, v...)
-	os.Stderr.Write([]byte("\n"))
-	os.Exit(1)
+    fmt.Fprintf(os.Stderr, format, v...)
+    os.Stderr.Write([]byte("\n"))
+    os.Exit(1)
 }
 
-// VERSION passed at build time
 var VERSION = "unknown"
 
 func main() {
-	flag.Usage = func() {
-		die(`srv %s (go version %s)
 
-usage: %s [-q] [-p port] [-c certfile -k keyfile] directory
 
-directory       path to directory to serve (default: .)
 
--q              quiet; disable all logging
--p port         port to listen on (default: 8000)
--b address      listener socket's bind address (default: 127.0.0.1)
--c certfile     optional path to a PEM-format X.509 certificate
--k keyfile      optional path to a PEM-format X.509 key
-`, VERSION, runtime.Version(), os.Args[0])
-	}
 
-	var quiet bool
-	var port, bindAddr, certFile, keyFile string
-	flag.BoolVar(&quiet, "q", false, "")
-	flag.StringVar(&port, "p", "8000", "")
-	flag.StringVar(&bindAddr, "b", "127.0.0.1", "")
-	flag.StringVar(&certFile, "c", "", "")
-	flag.StringVar(&keyFile, "k", "", "")
-	flag.Parse()
+var (
+    port, bindAddr, certFile, keyFile, ftpPass, ftpUser, ftpBindaddr string
+    quiet, enableFTP bool
+    ftpPort int
+)
 
-	certFileSpecified := certFile != ""
-	keyFileSpecified := keyFile != ""
-	if certFileSpecified != keyFileSpecified {
-		die("You must specify both -c certfile -k keyfile.")
-	}
+flag.BoolVar(&quiet, "q", false, "quiet; disable all logging")
+flag.StringVar(&port, "port", "8000", "port to listen on")
+flag.StringVar(&bindAddr, "bind", "127.0.0.1", "listener socket's bind address")
+flag.StringVar(&certFile, "cert", "", "path to SSL/TLS certificate file")
+flag.StringVar(&keyFile, "key", "", "path to SSL/TLS key file")
+flag.BoolVar(&enableFTP, "ftp", false, "enable FTP server")
+flag.StringVar(&ftpPass, "ftppass", "password", "set ftp password")
+flag.StringVar(&ftpUser, "ftpuser", "username", "set ftp username")
+flag.IntVar(&ftpPort, "ftpport", 2121, "set port for ftp server")
+flag.StringVar(&ftpBindaddr, "ftpb", "127.0.0.1", "ftp listener socket's bind address")
+    flag.Parse()
 
-	listenAddr := net.JoinHostPort(bindAddr, port)
-	_, err := net.ResolveTCPAddr("tcp", listenAddr)
-	if err != nil {
-		die("Could not resolve the address to listen to: %s", listenAddr)
-	}
+    listenAddr := net.JoinHostPort(bindAddr, port)
+    _, err := net.ResolveTCPAddr("tcp", listenAddr)
+    if err != nil {
+        die("Could not resolve the address to listen to: %s", listenAddr)
+    }
 
-	srvDir := "."
-	posArgs := flag.Args()
-	if len(posArgs) > 0 {
-		srvDir = posArgs[0]
-	}
-	f, err := os.Open(srvDir)
-	if err != nil {
-		die(err.Error())
-	}
-	defer f.Close()
-	if fi, err := f.Stat(); err != nil || !fi.IsDir() {
-		die("%s isn't a directory.", srvDir)
-	}
+    srvDir := "."
+    posArgs := flag.Args()
 
-	c := &context{
-		srvDir: srvDir,
-	}
+if enableFTP {
+	log.Println("Start server with FTP enabled")
 
-	if quiet {
-		log.SetFlags(0) // disable log formatting to save cpu
-		log.SetOutput(io.Discard)
-	}
+go func() {
+        driver, err := file.NewDriver(srvDir)
+        if err != nil {
+            log.Fatal(err)
+        }
 
-	http.HandleFunc("/", c.handler)
+        s, err := server.NewServer(&server.Options{
+            Driver: driver,
+	    Port: ftpPort,
+	    Hostname: ftpBindaddr,
+            Auth: &server.SimpleAuth{
+                Name:     ftpUser,
+                Password: ftpPass,
+            },
+            Perm:      server.NewSimplePerm("root", "root"),
+        })
+        if err != nil {
+            log.Fatal(err)
+        }
 
-	if certFileSpecified && keyFileSpecified {
-		log.Printf("\tServing %s over HTTPS on %s", srvDir, listenAddr)
-		err = http.ListenAndServeTLS(listenAddr, certFile, keyFile, nil)
-	} else {
-		log.Printf("\tServing %s over HTTP on %s", srvDir, listenAddr)
-		err = http.ListenAndServe(listenAddr, nil)
-	}
+        if err := s.ListenAndServe(); err != nil {
+            log.Fatal(err)
+        }
+    }()
 
-	die(err.Error())
 }
+
+    if len(posArgs) > 0 {
+        srvDir = posArgs[0]
+    }
+    f, err := os.Open(srvDir)
+    if err != nil {
+        die(err.Error())
+    }
+    defer f.Close()
+    if fi, err := f.Stat(); err != nil || !fi.IsDir() {
+        die("%s isn't a directory.", srvDir)
+    }
+
+    c := &context{
+        srvDir: srvDir,
+    }
+
+    if quiet {
+        log.SetFlags(0)
+        log.SetOutput(io.Discard)
+    }
+
+    http.HandleFunc("/", c.handler)
+
+    log.Printf("\tServing %s over HTTP on %s", srvDir, listenAddr)
+
+    if certFile != "" && keyFile != "" {
+        log.Printf("\tUsing SSL/TLS with certificate %s and key %s", certFile, keyFile)
+        err = http.ListenAndServeTLS(listenAddr, certFile, keyFile, nil)
+    } else {
+        err = http.ListenAndServe(listenAddr, nil)
+    }
+
+    die(err.Error())
+}
+
